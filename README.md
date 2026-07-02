@@ -1,24 +1,61 @@
-# PPK Duty Node Backend V7
+# PPK Duty Node Backend V8
 
-เวอร์ชันนี้เพิ่มระบบวันเวรประจำสัปดาห์และแก้โปรไฟล์เองได้
+เวอร์ชันนี้ใช้โครงสร้างใหม่:
 
-## เพิ่มใหม่
+- Node.js + Socket.IO บน Render = API และ Real-time
+- Google Sheets = เก็บ Users / Records / Duties / Settings แบบถาวร
+- Apps Script = อัปโหลดรูปหลักฐานเข้า Google Drive ด้วยบัญชีเจ้าของสคริปต์
 
-- นักเรียนสมัครสมาชิกแล้วเลือกวันเวร เช่น วันจันทร์/พุธ/ศุกร์
-- ระบบแสดงข้อมูลเฉพาะสมาชิกห้องเดียวกันและวันเวรเดียวกัน
-- นักเรียนแก้โปรไฟล์เองได้: ชื่อ ชั้น ห้อง วันเวร และรหัสผ่านใหม่
-- ถ้าเปลี่ยนชั้น/ห้อง/วันเวร รายการเวรที่ยังไม่ส่งรูปจะถูกย้ายไปหน้าห้อง/วันใหม่ ถ้าย้ายไม่ได้จะให้เลือกหน้าที่ใหม่
-- เก็บข้อมูลถาวรใน Google Sheets และเก็บรูปใน Google Drive เหมือน V6
+เหตุผลที่เปลี่ยนจาก Service Account Drive upload:
 
-## ไฟล์ที่ต้องอัปขึ้น GitHub / Render
+Service Account ไม่มี Drive storage quota จึงไม่ควรใช้สร้างไฟล์รูปใน My Drive โดยตรง เวอร์ชันนี้ให้ Apps Script ทำหน้าที่สร้างไฟล์ใน Drive แทน
 
-- server.js
-- package.json
+## ไฟล์ที่ต้องอัป GitHub / Render
 
-หลังอัปแล้วให้ Render Deploy latest commit
+ต้องวางไฟล์เหล่านี้ไว้หน้าแรกของ repo `PPK-DUTY-NODE`
 
-## แก้ไขในเวอร์ชัน 7.0.1
+```text
+server.js
+package.json
+```
 
-- แก้บั๊ก `/api/room-progress` และ payload แบบ real-time ที่อาจแสดงข้อมูลผิดวันที่เมื่อดูย้อนหลังหรือส่ง `dateKey` เฉพาะวัน
-- เพิ่มคำสั่ง `npm run check` สำหรับตรวจ syntax ของ `server.js` ก่อน deploy
+ห้ามอัป ZIP อย่างเดียว เพราะ Render ไม่แตก ZIP ให้เอง
 
+## Environment Variables บน Render
+
+ต้องมีค่าต่อไปนี้:
+
+```text
+CLIENT_ORIGIN=*
+ADMIN_ID=admin
+ADMIN_PASSWORD=admin1234
+GOOGLE_SHEET_ID=1aUNaQZy5M5xGKcyMjT4bjHfT5aZxwVMM81bflfb4jFI
+GOOGLE_DRIVE_FOLDER_ID=1HGh0iEjxu33dokLxCy74EHqmlAm3_37m
+GOOGLE_SERVICE_ACCOUNT_EMAIL=อีเมล service account
+GOOGLE_PRIVATE_KEY=private_key ตัวที่ยังไม่รั่ว
+ENABLE_GOOGLE_STORAGE=true
+SEED_DEMO=false
+APPS_SCRIPT_UPLOAD_URL=URL Web App ของ Apps Script /exec
+APPS_SCRIPT_UPLOAD_TOKEN=token จาก Apps Script function setup()
+```
+
+## ตรวจผลหลัง Deploy
+
+เปิด:
+
+```text
+https://ppk-duty-node.onrender.com
+```
+
+ควรเห็น:
+
+```json
+{
+  "version": "8.0.0-sheets-appscript-drive",
+  "storage": "google-sheets-appscript-drive",
+  "driveUpload": "apps-script",
+  "appsScriptUploadReady": true
+}
+```
+
+ถ้า `appsScriptUploadReady` เป็น `false` แปลว่ายังไม่ได้ตั้ง `APPS_SCRIPT_UPLOAD_URL`

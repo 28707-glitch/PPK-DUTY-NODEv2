@@ -1,7 +1,7 @@
 {
   "name": "ppk-duty-node-backend",
-  "version": "7.0.1",
-  "description": "PPK Duty Node.js backend with weekday duty profile, Socket.IO realtime, Google Sheets, and Google Drive proof photos",
+  "version": "8.0.0",
+  "description": "PPK Duty Node.js backend with weekday duty profile, Socket.IO realtime, Google Sheets, and Apps Script Drive proof uploads",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

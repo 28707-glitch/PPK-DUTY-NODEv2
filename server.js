@@ -3,7 +3,6 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
-const { Readable } = require("stream");
 const { google } = require("googleapis");
 
 const app = express();
@@ -19,6 +18,8 @@ const SEED_DEMO = String(process.env.SEED_DEMO || "false").toLowerCase() === "tr
 // ใส่ค่าเริ่มต้นตามลิงก์ที่ผู้ใช้ให้มา แต่ยังสามารถ override ใน Render Environment ได้
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || "1aUNaQZy5M5xGKcyMjT4bjHfT5aZxwVMM81bflfb4jFI";
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || "1HGh0iEjxu33dokLxCy74EHqmlAm3_37m";
+const APPS_SCRIPT_UPLOAD_URL = process.env.APPS_SCRIPT_UPLOAD_URL || "";
+const APPS_SCRIPT_UPLOAD_TOKEN = process.env.APPS_SCRIPT_UPLOAD_TOKEN || "";
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "";
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || "";
 const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_CREDENTIALS_JSON || "";
@@ -35,9 +36,9 @@ const io = new Server(server, {
 });
 
 // -----------------------------------------------------------------------------
-// PPK Duty Node Backend — V7 weekday duty profile + Google Sheets/Drive
-// - Users / Records / Duties / Settings อยู่ใน Google Sheets
-// - รูปหลักฐานอยู่ใน Google Drive แล้วเก็บ photoUrl/photoFileId ในชีต
+// PPK Duty Node Backend — V8 weekday profile + Google Sheets + Apps Script Drive upload
+// - Users / Records / Duties / Settings อยู่ใน Google Sheets ผ่าน Service Account
+// - รูปหลักฐานอัปโหลดเข้า Google Drive ผ่าน Apps Script ที่รันด้วยบัญชีเจ้าของ Drive
 // - Socket.IO ยังใช้ส่งข้อมูลแบบ real-time เหมือนเดิม
 // -----------------------------------------------------------------------------
 
@@ -72,7 +73,6 @@ const SHEET_HEADERS = {
 };
 
 let sheetsClient = null;
-let driveClient = null;
 let googleStorageReady = false;
 let googleInitError = "";
 
@@ -262,13 +262,11 @@ async function initGoogleClients() {
     const authClient = new google.auth.GoogleAuth({
       credentials,
       scopes: [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file"
+        "https://www.googleapis.com/auth/spreadsheets"
       ]
     });
 
     sheetsClient = google.sheets({ version: "v4", auth: authClient });
-    driveClient = google.drive({ version: "v3", auth: authClient });
     googleStorageReady = true;
     return true;
   } catch (err) {
@@ -569,7 +567,7 @@ function appDataFor(user, params = {}) {
     progress: progressFor(recs, scopedUsers.length),
     scope: { dateKey, grade, room, dutyDay, dutyDayLabel: dutyDayLabel(dutyDay) },
     storage: {
-      mode: googleStorageReady ? "google-sheets-drive" : "memory-fallback",
+      mode: googleStorageReady ? "google-sheets-appscript-drive" : "memory-fallback",
       sheetId: GOOGLE_SHEET_ID,
       driveFolderId: GOOGLE_DRIVE_FOLDER_ID,
       error: googleStorageReady ? "" : googleInitError
@@ -619,40 +617,59 @@ function parseDataUrl(photoDataUrl) {
 }
 
 async function uploadProofToDrive({ photoDataUrl, record, user }) {
-  if (!googleStorageReady || !GOOGLE_DRIVE_FOLDER_ID) {
-    return { photoUrl: photoDataUrl, photoFileId: "" };
+  // V8: รูปไม่อัปโหลดด้วย Service Account โดยตรงแล้ว เพราะ Service Account ไม่มี Drive storage quota
+  // ใช้ Apps Script Web App ที่ Execute as: Me เพื่อสร้างไฟล์ใน Google Drive ของเจ้าของสคริปต์แทน
+  if (!googleStorageReady) {
+    return { photoUrl: photoDataUrl, photoFileId: "", photoViewUrl: "" };
   }
 
-  const { mimeType, ext, buffer } = parseDataUrl(photoDataUrl);
+  if (!APPS_SCRIPT_UPLOAD_URL) {
+    throw new Error("ยังไม่ได้ตั้ง APPS_SCRIPT_UPLOAD_URL ใน Render สำหรับอัปโหลดรูปผ่าน Apps Script");
+  }
+
+  const { mimeType, ext } = parseDataUrl(photoDataUrl);
   const safeName = `${record.dateKey}_g${record.grade}_r${record.room}_${record.studentId}_${Date.now()}.${ext}`.replace(/[^a-zA-Z0-9_.-]/g, "_");
 
-  const file = await driveClient.files.create({
-    requestBody: {
-      name: safeName,
-      parents: [GOOGLE_DRIVE_FOLDER_ID],
-      mimeType
-    },
-    media: {
+  const response = await fetch(APPS_SCRIPT_UPLOAD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "uploadProofImage",
+      token: APPS_SCRIPT_UPLOAD_TOKEN,
+      folderId: GOOGLE_DRIVE_FOLDER_ID,
+      fileName: safeName,
       mimeType,
-      body: Readable.from(buffer)
-    },
-    fields: "id,name,webViewLink,webContentLink"
+      photoDataUrl,
+      meta: {
+        recordId: record.recordId,
+        dateKey: record.dateKey,
+        dutyDay: record.dutyDay,
+        grade: record.grade,
+        room: record.room,
+        studentId: record.studentId,
+        userName: record.userName || user?.name || "",
+        dutyName: record.dutyName || ""
+      }
+    })
   });
 
-  const fileId = file.data.id;
+  const text = await response.text();
+  let data;
   try {
-    await driveClient.permissions.create({
-      fileId,
-      requestBody: { type: "anyone", role: "reader" }
-    });
+    data = JSON.parse(text);
   } catch (err) {
-    console.warn("Could not set Drive public permission:", err.message);
+    throw new Error(`Apps Script upload ตอบกลับไม่ใช่ JSON: ${text.slice(0, 180)}`);
   }
 
+  if (!response.ok || !data.ok) {
+    throw new Error(data.error || data.message || `Apps Script upload failed with HTTP ${response.status}`);
+  }
+
+  const fileId = data.photoFileId || data.fileId || "";
   return {
     photoFileId: fileId,
-    photoUrl: `https://drive.google.com/thumbnail?id=${fileId}&sz=w1200`,
-    photoViewUrl: file.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`
+    photoUrl: data.photoUrl || (fileId ? `https://drive.google.com/thumbnail?id=${fileId}&sz=w1200` : ""),
+    photoViewUrl: data.photoViewUrl || data.viewUrl || (fileId ? `https://drive.google.com/file/d/${fileId}/view` : "")
   };
 }
 
@@ -1043,17 +1060,19 @@ app.get("/", (req, res) => {
     realtime: "Socket.IO ready",
     status: "running",
     api: "Apps Script compatible action API ready",
-    version: "7.0.1-weekday-profile-datekey-fix",
+    version: "8.0.0-sheets-appscript-drive",
     adminStorage: "system-only",
-    storage: googleStorageReady ? "google-sheets-drive" : "memory-fallback",
+    storage: googleStorageReady ? "google-sheets-appscript-drive" : "memory-fallback",
     sheetId: GOOGLE_SHEET_ID,
     driveFolderId: GOOGLE_DRIVE_FOLDER_ID,
+    driveUpload: "apps-script",
+    appsScriptUploadReady: !!APPS_SCRIPT_UPLOAD_URL,
     storageError: googleStorageReady ? "" : googleInitError
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, serverTime: new Date().toISOString(), storage: googleStorageReady ? "google-sheets-drive" : "memory-fallback", storageError: googleStorageReady ? "" : googleInitError });
+  res.json({ ok: true, serverTime: new Date().toISOString(), storage: googleStorageReady ? "google-sheets-appscript-drive" : "memory-fallback", driveUpload: "apps-script", appsScriptUploadReady: !!APPS_SCRIPT_UPLOAD_URL, storageError: googleStorageReady ? "" : googleInitError });
 });
 
 app.post("/", async (req, res) => {
@@ -1123,7 +1142,7 @@ async function boot() {
 
   server.listen(PORT, () => {
     console.log(`PPK Duty Node backend running on port ${PORT}`);
-    console.log(`Storage mode: ${googleStorageReady ? "google-sheets-drive" : "memory-fallback"}`);
+    console.log(`Storage mode: ${googleStorageReady ? "google-sheets-appscript-drive" : "memory-fallback"}`);
   });
 }
 
