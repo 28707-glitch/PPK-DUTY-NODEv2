@@ -36,7 +36,7 @@ const io = new Server(server, {
 });
 
 // -----------------------------------------------------------------------------
-// PPK Duty Node Backend — V8 weekday profile + Google Sheets + Apps Script Drive upload
+// PPK Duty Node Backend — V10 student history + weekday profile + Google Sheets + Apps Script Drive upload
 // - Users / Records / Duties / Settings อยู่ใน Google Sheets ผ่าน Service Account
 // - รูปหลักฐานอัปโหลดเข้า Google Drive ผ่าน Apps Script ที่รันด้วยบัญชีเจ้าของ Drive
 // - Socket.IO ยังใช้ส่งข้อมูลแบบ real-time เหมือนเดิม
@@ -67,7 +67,7 @@ const defaultDuties = [
 
 const SHEET_HEADERS = {
   Users: ["userId", "studentId", "password", "name", "grade", "room", "role", "active", "createdAt", "updatedAt", "dutyDay"],
-  Records: ["recordId", "dateKey", "grade", "room", "userId", "studentId", "userName", "dutyId", "dutyName", "emoji", "status", "note", "photoUrl", "photoFileId", "captureMode", "captureClientAt", "cameraMetaJson", "selectedAt", "submittedAt", "reviewedAt", "updatedAt", "dutyDay"],
+  Records: ["recordId", "dateKey", "grade", "room", "userId", "studentId", "userName", "dutyId", "dutyName", "emoji", "status", "note", "photoUrl", "photoFileId", "captureMode", "captureClientAt", "cameraMetaJson", "selectedAt", "submittedAt", "reviewedAt", "updatedAt", "dutyDay", "archivedAt", "archiveReason"],
   Duties: ["dutyId", "grade", "room", "emoji", "name", "slots"],
   Settings: ["key", "value"]
 };
@@ -350,7 +350,7 @@ async function loadFromSheets() {
     });
   }
 
-  const recordRows = (await readRange("Records!A2:V")).filter(r => r.some(cell => clean(cell)));
+  const recordRows = (await readRange("Records!A2:X")).filter(r => r.some(cell => clean(cell)));
   for (const row of recordRows) {
     const o = rowToObject(SHEET_HEADERS.Records, row);
     if (!o.recordId) continue;
@@ -378,7 +378,9 @@ async function loadFromSheets() {
       submittedAt: clean(o.submittedAt),
       reviewedAt: clean(o.reviewedAt),
       updatedAt: clean(o.updatedAt),
-      dutyDay: normalizeDutyDay(o.dutyDay) || weekdayKeyFromDateKey(o.dateKey)
+      dutyDay: normalizeDutyDay(o.dutyDay) || weekdayKeyFromDateKey(o.dateKey),
+      archivedAt: clean(o.archivedAt),
+      archiveReason: clean(o.archiveReason)
     });
   }
 
@@ -432,7 +434,8 @@ async function saveRecords() {
     r.recordId, r.dateKey, r.grade, r.room, r.userId, r.studentId, r.userName,
     r.dutyId, r.dutyName, r.emoji, r.status, r.note || "", r.photoUrl || "", r.photoFileId || "",
     r.captureMode || "", r.captureClientAt || "", JSON.stringify(r.cameraMeta || {}),
-    r.selectedAt || "", r.submittedAt || "", r.reviewedAt || "", r.updatedAt || "", normalizeDutyDay(r.dutyDay) || weekdayKeyFromDateKey(r.dateKey)
+    r.selectedAt || "", r.submittedAt || "", r.reviewedAt || "", r.updatedAt || "", normalizeDutyDay(r.dutyDay) || weekdayKeyFromDateKey(r.dateKey),
+    r.archivedAt || "", r.archiveReason || ""
   ]));
 }
 
@@ -483,20 +486,114 @@ function knownRooms() {
     const [grade, room] = key.split("|");
     if (grade && room) map.set(key, { grade, room });
   });
+  records.forEach((record) => {
+    if (record.grade && record.room) {
+      map.set(roomDutyKey(record.grade, record.room), { grade: record.grade, room: record.room });
+    }
+  });
   map.set(roomDutyKey("6", "1"), { grade: "6", room: "1" });
   return Array.from(map.values()).sort((a, b) => `${a.grade}/${a.room}`.localeCompare(`${b.grade}/${b.room}`, "th", { numeric: true }));
 }
 
-function getRecords({ dateKey, grade = "", room = "", dutyDay = "" } = {}) {
+function getRecords({ dateKey, grade = "", room = "", dutyDay = "", includeArchived = false } = {}) {
   const d = normalizeDateKey(dateKey);
   const day = normalizeDutyDay(dutyDay);
   return records.filter((r) => {
+    if (!includeArchived && r.archivedAt) return false;
     if (r.dateKey !== d) return false;
     if (grade && String(r.grade) !== String(grade)) return false;
     if (room && String(r.room) !== String(room)) return false;
     if (day && normalizeDutyDay(r.dutyDay || weekdayKeyFromDateKey(r.dateKey)) !== day) return false;
     return true;
   });
+}
+
+function optionalDateKey(value) {
+  const s = clean(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return "";
+  const [year, month, day] = s.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? s : "";
+}
+
+function historyFor(params = {}) {
+  const dateFromInput = clean(params.dateFrom);
+  const dateToInput = clean(params.dateTo);
+  const dateFrom = optionalDateKey(params.dateFrom);
+  const dateTo = optionalDateKey(params.dateTo);
+  const grade = clean(params.grade);
+  const room = clean(params.room);
+  const dutyDay = normalizeDutyDay(params.dutyDay);
+  const status = clean(params.status).toLowerCase();
+  const search = clean(params.search).toLocaleLowerCase("th").slice(0, 100);
+  const pageSize = Math.max(10, Math.min(100, Math.trunc(Number(params.pageSize) || 50)));
+  let page = Math.max(1, Math.trunc(Number(params.page) || 1));
+
+  if ((dateFromInput && !dateFrom) || (dateToInput && !dateTo)) {
+    throw new Error("รูปแบบวันที่ค้นหาไม่ถูกต้อง");
+  }
+
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    throw new Error("วันที่เริ่มต้นต้องไม่อยู่หลังวันที่สิ้นสุด");
+  }
+
+  const allowedStatuses = new Set(["", "assigned", "rework", "done", "reviewed", "archived"]);
+  if (!allowedStatuses.has(status)) throw new Error("สถานะประวัติไม่ถูกต้อง");
+
+  const filtered = records.filter((record) => {
+    if (dateFrom && record.dateKey < dateFrom) return false;
+    if (dateTo && record.dateKey > dateTo) return false;
+    if (grade && String(record.grade) !== grade) return false;
+    if (room && String(record.room) !== room) return false;
+    if (dutyDay && normalizeDutyDay(record.dutyDay || weekdayKeyFromDateKey(record.dateKey)) !== dutyDay) return false;
+    if (status === "archived" && !record.archivedAt) return false;
+    if (status && status !== "archived" && record.status !== status) return false;
+    if (search) {
+      const haystack = [
+        record.userName,
+        record.studentId,
+        record.dutyName,
+        record.note,
+        record.grade,
+        record.room
+      ].map(value => clean(value).toLocaleLowerCase("th")).join(" ");
+      if (!haystack.includes(search)) return false;
+    }
+    return true;
+  }).sort((a, b) => {
+    return String(b.dateKey).localeCompare(String(a.dateKey))
+      || Number(a.grade || 0) - Number(b.grade || 0)
+      || Number(a.room || 0) - Number(b.room || 0)
+      || String(a.userName || "").localeCompare(String(b.userName || ""), "th");
+  });
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  page = Math.min(page, totalPages);
+  const start = (page - 1) * pageSize;
+  const uniqueStudents = new Set(filtered.map(record => record.userId || record.studentId).filter(Boolean)).size;
+  const dateCount = new Set(filtered.map(record => record.dateKey).filter(Boolean)).size;
+  const roomCount = new Set(filtered.map(record => roomDutyKey(record.grade, record.room))).size;
+
+  return {
+    ok: true,
+    records: filtered.slice(start, start + pageSize).map(publicRecord),
+    summary: {
+      total,
+      uniqueStudents,
+      dateCount,
+      roomCount,
+      submitted: filtered.filter(record => record.status === "done" || record.status === "reviewed").length,
+      reviewed: filtered.filter(record => record.status === "reviewed").length,
+      pending: filtered.filter(record => record.status === "assigned" || record.status === "rework").length,
+      withPhoto: filtered.filter(record => !!record.photoUrl).length,
+      archived: filtered.filter(record => !!record.archivedAt).length
+    },
+    pagination: { page, pageSize, total, totalPages },
+    filters: { dateFrom, dateTo, grade, room, dutyDay, status, search },
+    rooms: knownRooms(),
+    dutyDays: DUTY_DAYS
+  };
 }
 
 function getUsers({ grade = "", room = "", dutyDay = "" } = {}) {
@@ -744,6 +841,12 @@ async function handleAction(body = {}) {
     return appDataFor(user, body);
   }
 
+  if (action === "getHistory") {
+    // นักเรียนและแอดมินที่เข้าสู่ระบบแล้วดูประวัติย้อนหลังได้แบบอ่านอย่างเดียว
+    requireAuth(body.token);
+    return historyFor(body);
+  }
+
   if (action === "updateProfile") {
     const user = requireAuth(body.token);
     if (user.role === "admin") throw new Error("แอดมินไม่มีโปรไฟล์นักเรียนให้แก้ไข");
@@ -783,13 +886,14 @@ async function handleAction(body = {}) {
 
     records = records.filter((record) => {
       if (record.userId !== user.userId) return true;
-      record.userName = user.name;
-      record.studentId = user.studentId;
 
-      if (record.status === "done" || record.status === "reviewed") {
-        record.updatedAt = now;
+      // รายการที่ส่งแล้วหรือถูก archive คือหลักฐานย้อนหลัง ห้ามย้ายหรือแก้ชื่อเดิมตามโปรไฟล์ใหม่
+      if (record.archivedAt || record.status === "done" || record.status === "reviewed") {
         return true;
       }
+
+      record.userName = user.name;
+      record.studentId = user.studentId;
 
       const mappedDuty = newDuties.find((d) => clean(d.name) === clean(record.dutyName));
       if (!mappedDuty) {
@@ -797,7 +901,7 @@ async function handleAction(body = {}) {
         return false;
       }
 
-      const usedSlots = records.filter((r) => r !== record && r.dateKey === newDateKey && r.grade === grade && r.room === room && r.dutyId === mappedDuty.dutyId).length;
+      const usedSlots = records.filter((r) => !r.archivedAt && r !== record && r.dateKey === newDateKey && r.grade === grade && r.room === room && r.dutyId === mappedDuty.dutyId).length;
       if (usedSlots >= Number(mappedDuty.slots || 1)) {
         resetRecords += 1;
         return false;
@@ -861,12 +965,12 @@ async function handleAction(body = {}) {
       if (!duty) throw new Error("ไม่พบหน้าที่ที่เลือก");
     }
 
-    const existing = records.find((r) => r.dateKey === dateKey && r.userId === user.userId);
+    const existing = records.find((r) => !r.archivedAt && r.dateKey === dateKey && r.userId === user.userId);
     if (existing && (existing.status === "done" || existing.status === "reviewed")) {
       throw new Error("ส่งรูปแล้ว ไม่สามารถเปลี่ยนหน้าที่ได้");
     }
 
-    const sameDutyRecords = records.filter((r) => r.dateKey === dateKey && r.grade === grade && r.room === room && r.dutyId === duty.dutyId && (!existing || r.recordId !== existing.recordId));
+    const sameDutyRecords = records.filter((r) => !r.archivedAt && r.dateKey === dateKey && r.grade === grade && r.room === room && r.dutyId === duty.dutyId && (!existing || r.recordId !== existing.recordId));
     if (sameDutyRecords.length >= Number(duty.slots || 1)) throw new Error("หน้าที่นี้เต็มแล้ว");
 
     const now = new Date().toISOString();
@@ -930,6 +1034,7 @@ async function handleAction(body = {}) {
 
     const record = records.find((r) => r.recordId === recordId);
     if (!record) throw new Error("ไม่พบข้อมูลเวร");
+    if (record.archivedAt) throw new Error("รายการนี้ถูกเก็บเป็นประวัติแล้ว ไม่สามารถแก้ไขได้");
     if (user.role !== "admin" && record.userId !== user.userId) throw new Error("ส่งหลักฐานแทนคนอื่นไม่ได้");
     if (record.status === "done" || record.status === "reviewed") throw new Error("งานนี้ส่งรูปแล้ว ต้องให้แอดมินกดแก้ก่อน");
 
@@ -956,6 +1061,7 @@ async function handleAction(body = {}) {
     requireAdmin(body.token);
     const record = records.find((r) => r.recordId === clean(body.recordId));
     if (!record) throw new Error("ไม่พบรายการเวร");
+    if (record.archivedAt) throw new Error("รายการนี้ถูกเก็บเป็นประวัติแล้ว ไม่สามารถแก้ไขได้");
     if (!record.photoUrl) throw new Error("ยังไม่มีรูปหลักฐาน");
     record.status = "reviewed";
     record.reviewedAt = new Date().toISOString();
@@ -969,6 +1075,7 @@ async function handleAction(body = {}) {
     requireAdmin(body.token);
     const record = records.find((r) => r.recordId === clean(body.recordId));
     if (!record) throw new Error("ไม่พบรายการเวร");
+    if (record.archivedAt) throw new Error("รายการนี้ถูกเก็บเป็นประวัติแล้ว ไม่สามารถแก้ไขได้");
     record.status = "rework";
     record.updatedAt = new Date().toISOString();
     await persist("records");
@@ -1035,16 +1142,25 @@ async function handleAction(body = {}) {
     const dateKey = normalizeDateKey(body.dateKey);
     const grade = clean(body.grade);
     const room = clean(body.room);
-    const removed = [];
-    records = records.filter((r) => {
-      const match = r.dateKey === dateKey && (!grade || r.grade === grade) && (!room || r.room === room);
-      if (match) removed.push(r);
-      return !match;
+    const archivedAt = new Date().toISOString();
+    let archived = 0;
+    const affectedScopes = new Map();
+    records.forEach((record) => {
+      const match = !record.archivedAt && record.dateKey === dateKey && (!grade || record.grade === grade) && (!room || record.room === room);
+      if (!match) return;
+      record.archivedAt = archivedAt;
+      record.archiveReason = "admin_reset";
+      record.updatedAt = archivedAt;
+      archived += 1;
+      affectedScopes.set(roomDutyKey(record.grade, record.room), { grade:record.grade, room:record.room });
     });
     await persist("records");
-    if (grade && room) emitChange({ dateKey, grade, room, type: "today_reset" });
-    else io.to("admin").emit("appDataChanged", { type: "today_reset", scope: { dateKey, grade, room }, data: null });
-    return { ok: true, removed: removed.length };
+    if (affectedScopes.size) {
+      affectedScopes.forEach(scope => emitChange({ dateKey, grade:scope.grade, room:scope.room, type:"today_reset" }));
+    } else {
+      io.to("admin").emit("appDataChanged", { type:"today_reset", scope:{ dateKey, grade, room }, data:null });
+    }
+    return { ok: true, archived, removed: 0 };
   }
 
   if (!action) {
@@ -1060,13 +1176,14 @@ app.get("/", (req, res) => {
     realtime: "Socket.IO ready",
     status: "running",
     api: "Apps Script compatible action API ready",
-    version: "8.0.0-sheets-appscript-drive",
+    version: "10.0.0-student-history-sheets-appscript-drive",
     adminStorage: "system-only",
     storage: googleStorageReady ? "google-sheets-appscript-drive" : "memory-fallback",
     sheetId: GOOGLE_SHEET_ID,
     driveFolderId: GOOGLE_DRIVE_FOLDER_ID,
     driveUpload: "apps-script",
     appsScriptUploadReady: !!APPS_SCRIPT_UPLOAD_URL,
+    historyAccess: "authenticated-students-and-admin",
     storageError: googleStorageReady ? "" : googleInitError
   });
 });

@@ -1,7 +1,7 @@
 {
   "name": "ppk-duty-node-backend",
-  "version": "8.0.0",
-  "description": "PPK Duty Node.js backend with weekday duty profile, Socket.IO realtime, Google Sheets, and Apps Script Drive proof uploads",
+  "version": "10.0.0",
+  "description": "PPK Duty with school-wide student history, non-destructive resets, Socket.IO, Google Sheets, and Drive proof uploads",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "googleapis": "^144.0.0",
+    "googleapis": "^173.0.0",
     "socket.io": "^4.7.5"
   }
 }
